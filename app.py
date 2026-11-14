@@ -287,7 +287,13 @@ with st.sidebar:
     us_yield, us_yield_mode = numeric_override("U.S. 10-year yield (%)", us_yield_auto, 4.0, "rf_us")
     foreign_yield, foreign_yield_mode = numeric_override(f"{country} 10-year yield (%)", foreign_yield_auto,
                                                           4.0 if country == "United States" else 12.0, "rf_fx")
-    spread_auto = bundle["spread"][0] if bundle["spread"] else None
+    spread_data = bundle.get("spread")
+        if isinstance(spread_data, (list, tuple)):
+            spread_auto = spread_data[0] if spread_data else None
+        elif isinstance(spread_data, (int, float)):
+            spread_auto = spread_data
+        else:
+    spread_auto = None
     spread_us, spread_mode = numeric_override("USD BBB spread (percentage points)", spread_auto, 1.5, "spread_us")
     manual_fx_spread = st.checkbox("Override selected-currency BBB spread", value=False)
     fx_spread_pct = st.number_input("Selected-currency BBB spread (percentage points)",
