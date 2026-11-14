@@ -79,3 +79,17 @@ Note that the app defaults to the U.S. tax rate, not the slide's 35% example; to
 - Source observations are not guaranteed to share a common as-of date. Check original publications.
 - USD is also the target currency when United States is selected; both columns should match if the same input rates and no local-spread override are used.
 - This is an educational capital-budgeting model, not investment advice.
+
+## Version 2 improvements (November 2026)
+
+- Redesigned dashboard: blue gradient header, financial KPI cards, WACC bar chart, cleaner typography and compact diagnostics.
+- Damodaran BBB spread parser now reads the **first Baa2/BBB rating/spread pair** in the HTML row, which corresponds to **large non-financial service firms**, and detects the analysis date when present.
+- OECD query updated to the official **DSD_TAX_CIT@DF_CIT,2.0** dataflow, filtering **ST** (statutory) and **S13** (general government). The application rejects unexpected dimensions or missing country mappings rather than substituting invented data.
+- Trading Economics uses its dedicated [10-year government yields country table](https://tradingeconomics.com/country-list/government-bond-10y). Added `html5lib` to support pandas HTML parsing if needed; the new parser uses BeautifulSoup directly.
+- Added `pycountry` to map country names to ISO-3 codes in the OECD data.
+
+**Important limitations:** Public websites may restrict automated requests. No live HTTP integration test could be performed in the build environment. After deploying, press **Refresh external data** and check the diagnostics. A fetch timestamp is not a market quote timestamp; verify the underlying observation date at the provider. Some jurisdictions do not have an OECD observation or a Trading Economics quote; manually verify and override those inputs. The U.S. tax fallback of 21% is federal-only and is **not** a substitute for the OECD combined statutory rate.
+
+### Validation benchmark (illustrative Colombia inputs)
+
+Use unlevered beta 0.80, tax 35%, ERP 6.5%, debt share 30%, U.S. yield 4%, Colombia yield 12%, USD spread 1.5 percentage points. Expected USD WACC **8.5265%** and COP WACC **16.0670%** (rounded), as in the course slides. This is a **calculation test**, not a claim about current market rates.
