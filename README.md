@@ -1,95 +1,76 @@
-# International Cost of Capital App
+# International Cost of Capital
 
-A Python 3.12 / Streamlit application comparing a project's cost of equity, pretax and after-tax debt cost, and WACC in USD and the currency of a selected country.
+A Streamlit dashboard for comparing a project's USD and local-currency cost of equity, debt and WACC. Designed for Python **3.12** and the class methodology.
 
-## Run locally
+## Deploy
+
+1. Upload **app.py**, **requirements.txt** and **README.md** to the root of your GitHub repository, replacing the previous files.
+2. In Streamlit Community Cloud, redeploy the app from the repository. Select Python 3.12 if the setting is available.
+3. Use **Refresh external data** in the left sidebar. Inspect **Data provenance and diagnostics**.
+4. Check that U.S. and local government yields differ when appropriate; validate the tax input and any manually provided values.
+
+For local execution:
 
 ```bash
-python -m venv .venv
-# macOS/Linux: source .venv/bin/activate
-# Windows: .venv\Scripts\activate
 python -m pip install -r requirements.txt
 streamlit run app.py
 ```
 
-## Deploy to Streamlit Community Cloud
+## Key improvements in v3
 
-1. Create a GitHub repository and upload `app.py`, `requirements.txt`, and `README.md` to its root.
-2. In Streamlit Community Cloud, select **Create app**, connect the repository and choose `app.py` as the entry point.
-3. Set the Python version to **3.12** in deployment settings if available, then deploy.
-4. Check **Data provenance and diagnostics** in the deployed app and enter verified manual values for any source that cannot be retrieved.
+- **Trading Economics**: parses the public country-list 10-year yield table by individual HTML rows and validates that at least five countries, including the United States, have been identified; tries the `bonds` page as a secondary route. A blocked or changed website still requires manual input.
+- **OECD**: replaces the previous failing SDMX endpoint with the OECD's **2026** published Figure 2.1 source workbook, linked by Statlink, and applies strict column validation to avoid confusing central with combined statutory rates. If the workbook layout changes or the publisher blocks downloads, the app tells users to provide a checked manual value. This is **not** a promise of unrestricted scraping.
+- **Currency display**: explicitly warns when the U.S. and selected-country government yields are identical (conversion factor = 1, making results the same). For the United States as target, both scenarios are forced to use identical tax/yield inputs and the local spread override is ignored.
+- **Source controls**: sidebar displays whether each input is fetched or manual. Failed sources remain clearly labelled, not silently presented as fresh observations.
+- Keeps the v2 interface, side-by-side results, methodology, all-industry benchmark and CSV downloads.
 
-## Features
+## Sources
 
-- Select industry and country; initial settings: Software (System & Application), United States, U.S. tax rate, ERP 6.5%, debt share 30%.
-- Refresh external data (cached for one hour between refreshes).
-- Independently override unlevered beta, U.S. and local statutory corporate tax rates, U.S. BBB credit spread, and both 10-year government yields.
-- Optionally override local-currency BBB spread; otherwise derive it with the currency conversion factor.
-- Choose whether to apply U.S. or selected-country corporate tax rate to **both** financing scenarios.
-- Compare USD and local results side by side, inspect formulas and all-industry results, and download CSV files.
-
-## Source links and data integrity
-
-| Variable | Primary source | Retrieval approach |
+| Input | Source | URL |
 |---|---|---|
-| U.S. industry unlevered beta | [Damodaran U.S. beta workbook](https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls) | Download XLS, locate Industry Name and Unlevered Beta columns |
-| BBB/Baa2 USD spread | [Damodaran ratings table](https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html) | Extract explicitly labeled BBB spread column; otherwise manual |
-| Combined statutory corporate tax | [OECD corporate tax statistics](https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html) | Attempt OECD public SDMX CSV and identify combined statutory measure; otherwise manual |
-| U.S. and local 10-year yields | [Trading Economics bonds](https://tradingeconomics.com/bonds) | Parse public HTML tables, if available; otherwise manual |
+| Industry unlevered beta | Aswath Damodaran, U.S. industries | https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls |
+| BBB borrowing spread | Aswath Damodaran, large non-financial firms Baa2/BBB | https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html |
+| Corporate tax rates | OECD Corporate Tax Statistics 2026, combined statutory rate | https://www.oecd.org/en/publications/corporate-tax-statistics-2026_73af6222-en/full-report/statutory-corporate-income-tax-rates_ce84abb9.html |
+| Tax chart/source workbook | OECD Statlink Figure 2.1 | https://stat.link/mstq82 |
+| Ten-year government yields | Trading Economics country listing | https://tradingeconomics.com/country-list/government-bond-10y |
 
-**Important:** The OECD SDMX endpoint and publisher HTML schemas can change. OECD's 2024 report is not necessarily the most recent available observation. The app never silently labels an unverified fallback as the latest value. The source panel shows retrieval errors and retrieval time, but **retrieval time is not observation date**. Confirm the exact source publication/observation dates manually before submitting or relying on the model. The six fallback beta values and default manual yield/spread/tax numbers are **illustrative only**, not sourced current market observations. Country availability is restricted to the countries listed in `COUNTRIES`; extend that mapping for additional countries and their ISO currencies.
+**Important:** Tax years and bond quote dates are not necessarily aligned. The date a scrape runs is not the observation date. This project does not provide investment-grade pricing data. Data-provider websites may block requests from Streamlit hosting; in that case, verify the values at the original source and enter manual overrides.
 
-## Financial methodology
+## Controls and defaults
 
-Let `d = D/(D+E)`, `tau` = selected corporate tax rate, `ERP` = equity risk premium, `s` = USD BBB borrowing spread, and `Rf` = 10-year government yield. Rates in the formulas below are decimals, not percentage points.
+- Default industry: Software (System & Application); country: United States; ERP: 6.5%; target debt share: 30%; tax rate: U.S.
+- The user can override unlevered beta, U.S. and local corporate tax, both ten-year government yields and USD BBB spread. Local BBB spread can be overridden separately or calculated automatically.
+- **Manual defaults are illustrative, not verified latest quotes.** In particular, 21% is a U.S. federal-only tax fallback, **not the OECD combined statutory rate**.
+- Selecting another country does **not** automatically switch tax: use the U.S./selected-country tax toggle. The same chosen rate is applied to both columns.
 
-1. `D/E = d/(1-d)`
-2. `beta_e = beta_u * [1 + (1-tau)*D/E]`
-3. `Re_USD = Rf_USD + beta_e*ERP`
-4. `Rd_USD = Rf_USD + s_USD`
-5. `WACC_USD = (1-d)*Re_USD + d*Rd_USD*(1-tau)`
-6. `F = (1+Rf_local)/(1+Rf_USD)`
-7. `Re_local = (1+Re_USD)*F - 1`
-8. `s_local = s_USD*F` by default (or user-provided local spread)
-9. `Rd_local = Rf_local + s_local`
-10. `WACC_local = (1-d)*Re_local + d*Rd_local*(1-tau)`
+## Financial formulas
 
-These match the supplied lecture-slide method: debt and interest tax shield have zero beta, the tax shield is usable, debt share is held fixed, the same tax rate applies in both currencies, and the local currency equity return is converted via gross government-yield ratios. No separate country equity premium is added. Government yields are only proxies for risk-free rates; relative PPP/equal real rates is a modeling approximation, not an exact identity for market expected FX changes. The formula for local debt spreads follows the slide's convention; it is not necessarily the only possible way to model credit spreads.
+All returns, rates and spreads are decimals internally:
 
-## Validation example (Colombia; illustrative slide inputs)
+```
+D/E = d / (1 - d)
+beta_e = beta_u * (1 + (1 - tax) * D/E)
+Re_USD = Rf_USD + beta_e * ERP
+Rd_USD = Rf_USD + spread_USD
+WACC_USD = (1-d)*Re_USD + d*Rd_USD*(1-tax)
+F = (1 + Rf_local) / (1 + Rf_USD)
+Re_local = (1 + Re_USD)*F - 1
+spread_local = spread_USD*F          # unless manually overridden
+Rd_local = Rf_local + spread_local
+WACC_local = (1-d)*Re_local + d*Rd_local*(1-tax)
+```
 
-Inputs: `beta_u=0.80`, `d=30%`, `tau=35%`, `ERP=6.5%`, `Rf_USD=4%`, `Rf_COP=12%`, `s_USD=1.5 percentage points`.
+The class model assumes a zero-beta debt and interest tax shield, fully usable interest deductions, identical target financing mix and project tax rate across currencies, and no additional country equity premium. Government yields are imperfect proxies for risk-free rates; expected FX conversion is an approximate PPP/equal real-rate assumption.
 
-Expected approximately:
+## Numerical checks
 
-| Output | USD | COP |
+Using the **illustrative Colombia slide** (beta 0.80; debt share 30%; tax 35%; ERP 6.5%; U.S. 10Y 4%; Colombia 10Y 12%; BBB spread 1.5 percentage points) yields:
+
+| Measure | USD | COP |
 |---|---:|---:|
-| Relevered equity beta | 1.022857 | 1.022857 |
 | Cost of equity | 10.6486% | 19.1600% |
-| Pretax cost of debt | 5.5000% | 13.6154% |
-| After-tax cost of debt | 3.5750% | 8.8500% |
-| WACC | 8.5265% | 16.0670% |
+| Pretax debt cost | 5.5000% | 13.6154% |
+| After-tax debt cost | 3.5750% | 8.8500% |
+| WACC | **8.5265%** | **16.0670%** |
 
-Note that the app defaults to the U.S. tax rate, not the slide's 35% example; to reproduce the example, override the tax rate to 35% and provide all example values manually. Results retain full precision internally and round for display.
-
-## Limitations
-
-- Public sites may change markup or block scraping; an API key is not required but reliable automated access is not guaranteed.
-- The OECD SDMX API query may require updating to a current dataflow. If the measure cannot be identified safely, the app asks for a manual rate rather than picking an arbitrary OECD value.
-- Source observations are not guaranteed to share a common as-of date. Check original publications.
-- USD is also the target currency when United States is selected; both columns should match if the same input rates and no local-spread override are used.
-- This is an educational capital-budgeting model, not investment advice.
-
-## Version 2 improvements (November 2026)
-
-- Redesigned dashboard: blue gradient header, financial KPI cards, WACC bar chart, cleaner typography and compact diagnostics.
-- Damodaran BBB spread parser now reads the **first Baa2/BBB rating/spread pair** in the HTML row, which corresponds to **large non-financial service firms**, and detects the analysis date when present.
-- OECD query updated to the official **DSD_TAX_CIT@DF_CIT,2.0** dataflow, filtering **ST** (statutory) and **S13** (general government). The application rejects unexpected dimensions or missing country mappings rather than substituting invented data.
-- Trading Economics uses its dedicated [10-year government yields country table](https://tradingeconomics.com/country-list/government-bond-10y). Added `html5lib` to support pandas HTML parsing if needed; the new parser uses BeautifulSoup directly.
-- Added `pycountry` to map country names to ISO-3 codes in the OECD data.
-
-**Important limitations:** Public websites may restrict automated requests. No live HTTP integration test could be performed in the build environment. After deploying, press **Refresh external data** and check the diagnostics. A fetch timestamp is not a market quote timestamp; verify the underlying observation date at the provider. Some jurisdictions do not have an OECD observation or a Trading Economics quote; manually verify and override those inputs. The U.S. tax fallback of 21% is federal-only and is **not** a substitute for the OECD combined statutory rate.
-
-### Validation benchmark (illustrative Colombia inputs)
-
-Use unlevered beta 0.80, tax 35%, ERP 6.5%, debt share 30%, U.S. yield 4%, Colombia yield 12%, USD spread 1.5 percentage points. Expected USD WACC **8.5265%** and COP WACC **16.0670%** (rounded), as in the course slides. This is a **calculation test**, not a claim about current market rates.
+Automated local checks cover: code compilation, sample Trading Economics HTML table parsing, sample OECD Excel layout parsing, Colombia WACC, and the identical-currency formula. **Live network fetches and Streamlit Cloud operation were not verified in the build environment**, so inspect diagnostics after deployment.
