@@ -287,13 +287,17 @@ with st.sidebar:
     us_yield, us_yield_mode = numeric_override("U.S. 10-year yield (%)", us_yield_auto, 4.0, "rf_us")
     foreign_yield, foreign_yield_mode = numeric_override(f"{country} 10-year yield (%)", foreign_yield_auto,
                                                           4.0 if country == "United States" else 12.0, "rf_fx")
+    # source_bundle stores each loader's returned value in data[name] and its
+    # provenance text in status[name]. The spread is therefore a float, not a tuple.
     spread_data = bundle.get("spread")
-        if isinstance(spread_data, (list, tuple)):
-            spread_auto = spread_data[0] if spread_data else None
-        elif isinstance(spread_data, (int, float)):
-            spread_auto = spread_data
-        else:
-    spread_auto = None
+    if isinstance(spread_data, (int, float, np.integer, np.floating)) and np.isfinite(spread_data):
+        spread_auto = float(spread_data)
+    elif isinstance(spread_data, (tuple, list)) and spread_data:
+        # Backward-compatible with older cached/source structures.
+        candidate = spread_data[0]
+        spread_auto = float(candidate) if isinstance(candidate, (int, float)) and np.isfinite(candidate) else None
+    else:
+        spread_auto = None
     spread_us, spread_mode = numeric_override("USD BBB spread (percentage points)", spread_auto, 1.5, "spread_us")
     manual_fx_spread = st.checkbox("Override selected-currency BBB spread", value=False)
     fx_spread_pct = st.number_input("Selected-currency BBB spread (percentage points)",
