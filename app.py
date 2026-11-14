@@ -4,6 +4,7 @@ from __future__ import annotations
 from datetime import datetime, timezone
 from io import BytesIO
 import re
+import json
 import unicodedata
 
 import numpy as np
@@ -17,9 +18,9 @@ st.set_page_config(page_title="International Cost of Capital", page_icon="🌐",
 BETAS_URL = "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls"
 RATINGS_URL = "https://pages.stern.nyu.edu/adamodar/New_Home_Page/datafile/ratings.html"
 OECD_URL = "https://www.oecd.org/en/publications/corporate-tax-statistics-2024_9c27d6e8-en/full-report/statutory-corporate-income-tax-rates_440f9286.html"
-BONDS_URL = "https://tradingeconomics.com/bonds"
+BONDS_URL = "https://tradingeconomics.com/country-list/government-bond-10y"
 # OECD SDMX public CSV endpoint; dynamic data availability and dimension names can change.
-OECD_API = "https://sdmx.oecd.org/public/rest/v1/data/OECD.CTP.TPS,DSD_CIT@DF_CIT,1.1/.A.."
+OECD_API = "https://sdmx.oecd.org/public/rest/v1/data/OECD.CTP.TPS,DSD_TAX_CIT@DF_CIT,2.0/.A..ST..S13..."
 COUNTRIES = {
     "United States": ("USD", "United States"), "Australia": ("AUD", "Australia"),
     "Austria": ("EUR", "Austria"), "Belgium": ("EUR", "Belgium"),
@@ -91,77 +92,98 @@ def load_betas() -> tuple[dict[str, float], str]:
 
 
 def load_bbb_spread() -> tuple[float, str]:
-    tables = pd.read_html(BytesIO(fetch(RATINGS_URL).content))
-    for df in tables:
-        for _, row in df.iterrows():
-            cells = [str(v) for v in row.tolist()]
-            if not any(re.search(r"\b(?:Baa2|BBB)\b", x, re.I) for x in cells):
-                continue
-            # Damodaran ratings table: spread generally follows rating; find explicitly labeled spread column.
-            cols = [normalized(c) for c in df.columns]
-            candidates = [i for i, c in enumerate(cols) if "spread" in c]
-            for i in candidates:
-                value = parse_number(row.iloc[i])
-                if value is not None and 0 < value < 20:
-                    return value, "Damodaran ratings table: BBB/Baa2 spread (%)"
-    raise ValueError("BBB spread not unambiguously located; enter manual spread")
+    """The left-hand rating/spread pair is for large non-financial firms."""
+    soup = BeautifulSoup(fetch(RATINGS_URL).text, "html.parser")
+    for tr in soup.find_all("tr"):
+        cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"], recursive=False)]
+        rating_positions = [i for i, cell in enumerate(cells)
+                            if re.fullmatch(r"Baa2\s*/\s*BBB", cell, re.I)]
+        if not rating_positions:
+            continue
+        # The first BBB rating belongs to the large non-financial company section.
+        pos = rating_positions[0]
+        if pos + 1 < len(cells):
+            raw = cells[pos + 1]
+            value = parse_number(raw)
+            if value is not None and "%" in raw and 0 < value < 20:
+                date_match = re.search(r"(?:January|February|March|April|May|June|July|August|September|October|November|December)\s+20\d{2}", soup.get_text(" ", strip=True))
+                date_label = date_match.group(0) if date_match else "date not detected"
+                return value, f"Damodaran large non-financial firms Baa2/BBB; analysis: {date_label}"
+    raise ValueError("Cannot identify the large non-financial Baa2/BBB spread in the source table")
 
 
 def load_bond_yields() -> tuple[dict[str, float], str]:
-    html = fetch(BONDS_URL).text
-    tables = pd.read_html(BytesIO(html.encode()))
-    result: dict[str, float] = {}
-    for table in tables:
-        cols = [normalized(c) for c in table.columns]
-        country_idx = next((i for i, c in enumerate(cols) if c in ("country", "name")), None)
-        yield_idx = next((i for i, c in enumerate(cols) if c in ("yield", "last", "yield10y")), None)
-        if country_idx is None or yield_idx is None:
+    """Parse the dedicated country-list table and retain per-country reference dates."""
+    soup = BeautifulSoup(fetch(BONDS_URL).text, "html.parser")
+    result, dates = {}, {}
+    for table in soup.find_all("table"):
+        headings = [normalized(th.get_text(" ", strip=True)) for th in table.find_all("th")]
+        if "country" not in headings or "last" not in headings:
             continue
-        for _, row in table.iterrows():
-            name = str(row.iloc[country_idx]).strip()
-            val = parse_number(row.iloc[yield_idx])
-            if val is not None and -10 < val < 100:
-                for country in COUNTRIES:
-                    if normalized(name) == normalized(country) or normalized(name) == normalized(country + " 10Y"):
-                        result[country] = val
+        ci, yi = headings.index("country"), headings.index("last")
+        ri = headings.index("reference") if "reference" in headings else None
+        for tr in table.find_all("tr"):
+            cells = [c.get_text(" ", strip=True) for c in tr.find_all(["td", "th"], recursive=False)]
+            if len(cells) <= max(ci, yi):
+                continue
+            name = re.sub(r"\s+", " ", cells[ci]).strip()
+            val = parse_number(cells[yi])
+            if val is None or not -10 < val < 100:
+                continue
+            for country in COUNTRIES:
+                if normalized(name) == normalized(country):
+                    result[country] = val
+                    if ri is not None and ri < len(cells):
+                        dates[country] = cells[ri]
+        if result:
+            break
     if not result:
-        raise ValueError("Bond yield table unavailable or its structure changed")
-    return result, "Trading Economics 10-year bond table (retrieval timestamp; quote dates may differ)"
+        raise ValueError("Country-list yield table not found; website may block automated requests")
+    return result, f"Trading Economics 10Y government yields; {len(result)} countries; per-country reference dates shown in inputs"
 
 
 def load_oecd_tax() -> tuple[dict[str, float], str]:
-    # Explicitly filter for combined statutory corporate income tax, not effective tax or federal-only rates.
-    response = requests.get(OECD_API, params={"format": "csvfilewithlabels", "startPeriod": "2023"}, timeout=25,
-                            headers={"Accept": "text/csv"})
+    """OECD 2.0 statutory/general-government CIT series; never mix other measures."""
+    response = requests.get(OECD_API, params={"startPeriod": "2024", "dimension_at_observation": "AllDimensions"},
+                            timeout=35, headers={"Accept": "csvfilewithlabels", "User-Agent": "Mozilla/5.0"})
     response.raise_for_status()
     df = pd.read_csv(BytesIO(response.content), low_memory=False)
-    col = {normalized(c): c for c in df.columns}
-    country_col = next((col[k] for k in ("referencearea", "refarea", "country") if k in col), None)
-    value_col = next((col[k] for k in ("obsvalue", "value") if k in col), None)
-    year_col = next((col[k] for k in ("timeperiod", "year") if k in col), None)
-    if not all((country_col, value_col, year_col)):
-        raise ValueError("OECD dataset schema changed; manually supply statutory rate")
-    # OECD dataset has multiple tax measures. Never silently choose the first series.
-    measure_cols = [c for c in df.columns if any(x in normalized(c) for x in ("measure", "taxrate", "taxtype", "indicator"))]
-    if not measure_cols:
-        raise ValueError("Cannot verify combined statutory rate measure in OECD response")
-    mask = pd.Series(False, index=df.index)
-    for c in measure_cols:
-        mask |= df[c].astype(str).str.contains("combined statutory|combined corporate income tax|combined cit", case=False, regex=True, na=False)
-    df = df.loc[mask].copy()
-    if df.empty:
-        raise ValueError("Combined statutory tax series not found in OECD response")
-    df["_year"] = pd.to_numeric(df[year_col], errors="coerce")
-    df["_value"] = pd.to_numeric(df[value_col], errors="coerce")
-    df = df.dropna(subset=["_year", "_value"]).sort_values("_year")
-    result = {}
-    for country in COUNTRIES:
-        subset = df[df[country_col].astype(str).map(normalized) == normalized(country)]
+    cols = {normalized(c): c for c in df.columns}
+    def pick(*keys):
+        return next((cols[k] for k in keys if k in cols), None)
+    area = pick("referencearea", "refarea")
+    obs = pick("obsvalue")
+    year = pick("timeperiod")
+    if not all((area, obs, year)):
+        raise ValueError(f"Unexpected OECD CSV columns: {list(df.columns)[:12]}")
+    # Query explicitly selects ST (statutory) and S13 (general government).
+    for dimension, expected in (("targeting", "ST"), ("institutionalsector", "S13")):
+        col = pick(dimension)
+        if col is not None and not df[col].astype(str).str.contains(expected + "|statutory|general government", case=False, regex=True).all():
+            raise ValueError(f"OECD {dimension} includes unexpected observations")
+    iso = {"United States":"USA", "South Korea":"KOR", "Czech Republic":"CZE", "United Kingdom":"GBR", "Turkey":"TUR"}
+    try:
+        import pycountry
+        for name in COUNTRIES:
+            if name not in iso:
+                iso[name] = pycountry.countries.lookup(name).alpha_3
+    except (LookupError, ImportError):
+        pass
+    df["_year"] = pd.to_numeric(df[year], errors="coerce")
+    df["_value"] = pd.to_numeric(df[obs], errors="coerce")
+    df = df.dropna(subset=["_year", "_value"])
+    rates, years = {}, {}
+    for country, code in iso.items():
+        subset = df[df[area].astype(str).map(normalized).isin([normalized(code), normalized(country)])]
         if not subset.empty:
-            result[country] = float(subset.iloc[-1]["_value"])
-    if not result:
-        raise ValueError("Country names/codes could not be matched to OECD tax series")
-    return result, f"OECD combined statutory CIT (latest matching year: {int(df['_year'].max())})"
+            latest = subset.sort_values("_year").iloc[-1]
+            value = float(latest["_value"])
+            if 0 <= value < 100:
+                rates[country] = value
+                years[country] = int(latest["_year"])
+    if not rates:
+        raise ValueError("OECD data downloaded but country codes could not be matched")
+    return rates, f"OECD combined statutory corporate tax, general government; {len(rates)} countries; latest series year {max(years.values())}"
 
 
 @st.cache_data(ttl=3600, show_spinner=False)
@@ -202,7 +224,21 @@ def percent(x):
     return f"{x * 100:.4f}%"
 
 
-st.title("🌐 International Cost of Capital")
+st.markdown("""<style>
+.block-container {max-width: 1380px; padding-top: 1.6rem; padding-bottom: 3rem}
+[data-testid="stSidebar"] {background: #f5f7fb}
+[data-testid="stMetric"] {background: white; border: 1px solid #e3e9f2; border-radius: 14px; padding: 16px 20px; box-shadow: 0 2px 8px rgba(18,42,76,.035)}
+[data-testid="stMetricLabel"] {color: #53657d}
+[data-testid="stMetricValue"] {color: #123b70; font-weight: 750}
+h1,h2,h3 {letter-spacing: -.025em}
+h1 {color: #132d50}
+[data-testid="stDownloadButton"] button {border-radius: 10px}
+.hero {background: linear-gradient(115deg,#102d52,#225c91); border-radius: 18px; color: white; padding: 25px 30px; margin-bottom: 22px}
+.hero h1 {color: white; margin: 0; font-size: 2.1rem}
+.hero p {color: #dceaf8; margin: 8px 0 0}
+.section-kicker {color: #53708f; font-size: .8rem; font-weight: 700; text-transform: uppercase; letter-spacing: .12em}
+</style>""", unsafe_allow_html=True)
+st.markdown('<div class="hero"><div class="section-kicker" style="color:#9fd0ff">FINANCIAL ANALYTICS · INTERNATIONAL PROJECTS</div><h1>International Cost of Capital</h1><p>Compare the cost of equity, borrowing and WACC across currencies with transparent assumptions.</p></div>', unsafe_allow_html=True)
 st.caption("Compare a project's cost of equity, borrowing costs, and WACC in USD and a selected country's currency")
 with st.sidebar:
     st.header("Data & sources")
@@ -279,7 +315,8 @@ results = calculate(beta, selected_tax / 100, debt_pct / 100, erp_pct / 100,
                     us_yield / 100, foreign_yield / 100, spread_us / 100,
                     fx_spread_pct / 100 if manual_fx_spread else None)
 
-st.subheader(f"Results · {industry} · {country}")
+st.markdown('<div class="section-kicker">01 / Capital cost comparison</div>', unsafe_allow_html=True)
+st.subheader(f"{industry}  ·  {country}")
 a, b = st.columns(2, gap="large")
 with a:
     st.markdown("### 🇺🇸 USD financing")
@@ -294,6 +331,14 @@ with b:
     st.metric("After-tax borrowing cost", percent(results["debt_after_tax_fx"]))
     st.metric("WACC", percent(results["wacc_fx"]))
 
+st.markdown("#### WACC comparison")
+import plotly.graph_objects as go
+fig = go.Figure(go.Bar(x=["USD", currency + " · " + country], y=[results["wacc_us"] * 100, results["wacc_fx"] * 100],
+                       text=[percent(results["wacc_us"]), percent(results["wacc_fx"])], textposition="outside",
+                       marker_color=["#164c7e", "#18a3a0"]))
+fig.update_layout(height=290, margin=dict(l=10,r=10,t=20,b=10), yaxis_title="Annual WACC (%)",
+                  paper_bgcolor="rgba(0,0,0,0)", plot_bgcolor="rgba(0,0,0,0)", showlegend=False)
+st.plotly_chart(fig, use_container_width=True)
 st.caption(f"Relevered equity beta: {results['beta_e']:.4f} | Selected tax rate: {selected_tax:.2f}% ({tax_choice}) | Debt: {debt_pct:.0f}% | ERP: {erp_pct:.2f}%")
 
 with st.expander("📐 Methodology and assumptions", expanded=True):
@@ -309,6 +354,7 @@ with st.expander("📐 Methodology and assumptions", expanded=True):
              "No separate country equity risk premium is added. Currency conversion assumes equal real rates / relative PPP as a simplifying approximation. "
              "A local-currency borrowing-spread override breaks exact USD-to-local conversion consistency by design.")
 
+st.markdown('<div class="section-kicker">02 / Industry benchmark</div>', unsafe_allow_html=True)
 st.subheader("All-industry comparison")
 rows = []
 for name, b_u in sorted(betas.items()):
@@ -342,14 +388,15 @@ summary = pd.DataFrame([{
 st.download_button("⬇ Download selected-project results (CSV)", summary.to_csv(index=False).encode("utf-8-sig"),
                    "project_cost_of_capital.csv", "text/csv")
 
-st.subheader("Data provenance and diagnostics")
-st.caption(f"Most recent fetch attempt: {retrieved_at}. A fetch timestamp is NOT the underlying observation/publication date.")
-for label, url, key in (("U.S. industry unlevered betas", BETAS_URL, "betas"),
-                        ("BBB spread", RATINGS_URL, "spread"),
-                        ("OECD statutory corporate tax rates", OECD_URL, "tax"),
-                        ("Trading Economics 10-year government yields", BONDS_URL, "bonds")):
-    st.markdown(f"**{label}:** [source]({url}) — {source_status[key]}")
-st.info("Data quality: Verify source observation dates and the exact OECD combined statutory tax definition. "
-        "Web pages may block automated requests or change their structure. Manual values are explicitly labeled, "
-        "and illustrative defaults must not be presented as the latest data. "
-        "When an OECD/Trading Economics series cannot be parsed confidently, the app requires a reviewed manual value.")
+st.markdown('<div class="section-kicker">03 / Data transparency</div>', unsafe_allow_html=True)
+with st.expander("Data provenance and diagnostics", expanded=False):
+    st.caption(f"Most recent fetch attempt: {retrieved_at}. A fetch timestamp is NOT the underlying observation/publication date.")
+    for label, url, key in (("U.S. industry unlevered betas", BETAS_URL, "betas"),
+                            ("BBB spread", RATINGS_URL, "spread"),
+                            ("OECD statutory corporate tax rates", OECD_URL, "tax"),
+                            ("Trading Economics 10-year government yields", BONDS_URL, "bonds")):
+        st.markdown(f"**{label}:** [source]({url}) — {source_status[key]}")
+    st.info("Data quality: Verify source observation dates and the exact OECD combined statutory tax definition. "
+            "Web pages may block automated requests or change their structure. Manual values are explicitly labeled, "
+            "and illustrative defaults must not be presented as the latest data. "
+            "When an OECD/Trading Economics series cannot be parsed confidently, the app requires a reviewed manual value.")
