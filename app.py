@@ -12,7 +12,7 @@ import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 
-APP_VERSION = "v5.0 · 2026-11-13 · OECD diagnostics"
+APP_VERSION = "v6.0 · 2026-11-13 · OECD ISO3 + rate normalization"
 
 st.set_page_config(page_title="International Cost of Capital", page_icon="🌐", layout="wide")
 
@@ -192,7 +192,19 @@ def parse_oecd_statlink_xlsx(content: bytes) -> tuple[dict[str, float], str]:
     """
     sheets = pd.read_excel(BytesIO(content), sheet_name=None, header=None, engine="openpyxl")
     names = {normalized(name): name for name in COUNTRIES}
+    # OECD Figure 2.1 uses ISO-3 jurisdiction labels (e.g. FRA, COL, HUN),
+    # not necessarily country names. Map these to the app's country names.
+    import pycountry
+    for app_country in COUNTRIES:
+        try:
+            code = pycountry.countries.lookup(app_country).alpha_3
+            names[normalized(code)] = app_country
+        except LookupError:
+            pass
     names.update({
+        "usa": "United States", "gbr": "United Kingdom",
+        "kor": "South Korea", "tur": "Turkey", "cze": "Czech Republic",
+        "fra": "France", "col": "Colombia", "hun": "Hungary",
         "korea": "South Korea", "republicofkorea": "South Korea",
         "korearepublicof": "South Korea", "turkiye": "Turkey",
         "czechia": "Czech Republic", "unitedstatesofamerica": "United States",
@@ -209,9 +221,13 @@ def parse_oecd_statlink_xlsx(content: bytes) -> tuple[dict[str, float], str]:
         name = names.get(normalized(x))
         return name if name in country_keys else None
 
-    def rate(x):
+    def rate(x, decimal_fraction=False):
         val = parse_number(x)
-        if val is None or not 0 <= val <= 60:
+        if val is None:
+            return None
+        if decimal_fraction:
+            val *= 100.0
+        if not 0 <= val <= 60:
             return None
         return float(val)
 
@@ -229,6 +245,8 @@ def parse_oecd_statlink_xlsx(content: bytes) -> tuple[dict[str, float], str]:
                        for key, expected in anchors.items() if key in mapping)
         conflicts = sum(abs(mapping[key] - expected) > 0.20
                         for key, expected in anchors.items() if key in mapping)
+        # Require at least two independently verified published values.
+        # This rejects an unrelated rate series or a misaligned row selection.
         if verified < 2 or conflicts:
             return
         # In the publication, the data refer to 2026; prefer this year in labels.
@@ -255,12 +273,13 @@ def parse_oecd_statlink_xlsx(content: bytes) -> tuple[dict[str, float], str]:
             for value_col in range(frame.shape[1]):
                 if value_col == country_col:
                     continue
-                pairs = [(name, rate(frame.iat[i, value_col])) for i, name in found]
-                header = " ".join(str(frame.iat[i, value_col]) for i in range(min(15, len(frame)))
+                for fraction_units in (False, True):
+                    pairs = [(name, rate(frame.iat[i, value_col], fraction_units)) for i, name in found]
+                    header = " ".join(str(frame.iat[i, value_col]) for i in range(min(15, len(frame)))
                                   if pd.notna(frame.iat[i, value_col]))
-                years = re.findall(r"(?<!\d)20\d{2}(?!\d)", header)
-                year_label = years[-1] if years else ""
-                evaluate(pairs, sheet_name, "countries in rows", label_text, year_label)
+                    years = re.findall(r"(?<!\d)20\d{2}(?!\d)", header)
+                    year_label = years[-1] if years else ""
+                    evaluate(pairs, sheet_name, "countries in rows", label_text, year_label)
 
         # Some chart source sheets put countries across a single row.
         for country_row in range(len(frame)):
@@ -271,12 +290,13 @@ def parse_oecd_statlink_xlsx(content: bytes) -> tuple[dict[str, float], str]:
             for value_row in range(len(frame)):
                 if value_row == country_row:
                     continue
-                pairs = [(name, rate(frame.iat[value_row, j])) for j, name in found]
-                header = " ".join(str(frame.iat[value_row, j]) for j in range(min(8, frame.shape[1]))
+                for fraction_units in (False, True):
+                    pairs = [(name, rate(frame.iat[value_row, j], fraction_units)) for j, name in found]
+                    header = " ".join(str(frame.iat[value_row, j]) for j in range(min(8, frame.shape[1]))
                                   if pd.notna(frame.iat[value_row, j]))
-                years = re.findall(r"(?<!\d)20\d{2}(?!\d)", header)
-                year_label = years[-1] if years else ""
-                evaluate(pairs, sheet_name, "countries in columns", label_text, year_label)
+                    years = re.findall(r"(?<!\d)20\d{2}(?!\d)", header)
+                    year_label = years[-1] if years else ""
+                    evaluate(pairs, sheet_name, "countries in columns", label_text, year_label)
 
     if not candidates:
         raise ValueError(
