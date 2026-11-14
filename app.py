@@ -12,6 +12,8 @@ import requests
 from bs4 import BeautifulSoup
 import streamlit as st
 
+APP_VERSION = "v5.0 · 2026-11-13 · OECD diagnostics"
+
 st.set_page_config(page_title="International Cost of Capital", page_icon="🌐", layout="wide")
 
 BETAS_URL = "https://pages.stern.nyu.edu/~adamodar/pc/datasets/betas.xls"
@@ -295,6 +297,23 @@ def parse_oecd_statlink_xlsx(content: bytes) -> tuple[dict[str, float], str]:
                    "checked against published France/Colombia/Hungary rates")
 
 
+def oecd_workbook_diagnostics(content: bytes) -> str:
+    """Safe structural preview; deliberately does not guess the tax measure."""
+    from zipfile import BadZipFile
+    try:
+        sheets = pd.read_excel(BytesIO(content), sheet_name=None, header=None, engine="openpyxl")
+    except (ValueError, BadZipFile, ImportError) as exc:
+        return f"Could not read workbook: {type(exc).__name__}: {exc}"
+    lines = []
+    for name, frame in list(sheets.items())[:10]:
+        lines.append(f"Sheet {name!r}: {len(frame)} rows x {len(frame.columns)} columns")
+        for _, row in frame.head(8).iterrows():
+            values = [str(v).strip()[:65] for v in row if pd.notna(v)]
+            if values:
+                lines.append("  " + " | ".join(values[:7]))
+    return "\n".join(lines)[:8000]
+
+
 def load_oecd_tax() -> tuple[dict[str, float], str]:
     """Read the downloadable OECD 2026 published source data rather than 403 SDMX."""
     response = fetch(OECD_STATLINK_XLSX, timeout=35)
@@ -303,8 +322,8 @@ def load_oecd_tax() -> tuple[dict[str, float], str]:
     return parse_oecd_statlink_xlsx(response.content)
 
 
-@st.cache_data(ttl=3600, show_spinner=False)
-def source_bundle():
+@st.cache_data(ttl=900, show_spinner=False)
+def source_bundle_v5():
     data, status = {}, {}
     for name, loader in (("betas", load_betas), ("spread", load_bbb_spread),
                          ("bonds", load_bond_yields), ("tax", load_oecd_tax)):
@@ -357,14 +376,33 @@ h1 {color: #132d50}
 </style>""", unsafe_allow_html=True)
 st.markdown('<div class="hero"><div class="section-kicker" style="color:#9fd0ff">FINANCIAL ANALYTICS · INTERNATIONAL PROJECTS</div><h1>International Cost of Capital</h1><p>Compare the cost of equity, borrowing and WACC across currencies with transparent assumptions.</p></div>', unsafe_allow_html=True)
 st.caption("Compare a project's cost of equity, borrowing costs, and WACC in USD and a selected country's currency")
+st.caption(f"App build: **{APP_VERSION}** · Refresh external data after every code update")
 with st.sidebar:
     st.header("Data & sources")
     if st.button("🔄 Refresh external data", use_container_width=True):
-        source_bundle.clear()
+        source_bundle_v5.clear()
         st.rerun()
 
 with st.spinner("Checking source availability…"):
-    bundle, source_status, retrieved_at = source_bundle()
+    bundle, source_status, retrieved_at = source_bundle_v5()
+
+# When the OECD API or workbook layout changes, the user may supply the
+# original OECD Figure 2.1 XLSX. The parser applies the same strict checks.
+with st.sidebar:
+    with st.expander("OECD tax data recovery", expanded=False):
+        st.caption("Optional: upload the official OECD Figure 2.1 Excel workbook. "
+                   "Only a validated combined statutory rate series is accepted.")
+        oecd_upload = st.file_uploader("Official OECD XLSX", type=["xlsx"], key="oecd_xlsx_upload")
+        if oecd_upload is not None:
+            try:
+                uploaded_rates, uploaded_status = parse_oecd_statlink_xlsx(oecd_upload.getvalue())
+                bundle["tax"] = uploaded_rates
+                source_status["tax"] = uploaded_status + " · User-uploaded OECD file"
+                st.success(f"Validated {len(uploaded_rates)} jurisdiction rates")
+            except Exception as exc:
+                st.error(f"OECD file cannot be validated: {type(exc).__name__}: {exc}")
+                with st.expander("Uploaded workbook structure"):
+                    st.code(oecd_workbook_diagnostics(oecd_upload.getvalue()), language="text")
 
 betas = bundle["betas"] or FALLBACK_BETAS
 beta_source = "Live Damodaran" if bundle["betas"] else "Illustrative fallback — verify before submission"
@@ -530,6 +568,16 @@ st.download_button("⬇ Download selected-project results (CSV)", summary.to_csv
 st.markdown('<div class="section-kicker">03 / Data transparency</div>', unsafe_allow_html=True)
 with st.expander("Data provenance and diagnostics", expanded=False):
     st.caption(f"Most recent fetch attempt: {retrieved_at}. A fetch timestamp is NOT the underlying observation/publication date.")
+    st.caption(f"Build: {APP_VERSION}. If this build is absent, GitHub deployment has not updated.")
+    if st.button("Inspect OECD workbook structure", key="inspect_oecd"):
+        try:
+            response = fetch(OECD_STATLINK_XLSX, timeout=35)
+            st.code(oecd_workbook_diagnostics(response.content), language="text")
+            st.download_button("Download the OECD source workbook for inspection",
+                               data=response.content, file_name="oecd_source_workbook_2026.xlsx",
+                               mime="application/vnd.openxmlformats-officedocument.spreadsheetml.sheet")
+        except Exception as exc:
+            st.error(f"OECD download failed: {type(exc).__name__}: {exc}")
     for label, url, key in (("U.S. industry unlevered betas", BETAS_URL, "betas"),
                             ("BBB spread", RATINGS_URL, "spread"),
                             ("OECD statutory corporate tax rates (2026)", OECD_URL, "tax"),
