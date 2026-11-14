@@ -180,42 +180,119 @@ def load_bond_yields() -> tuple[dict[str, float], str]:
 
 
 def parse_oecd_statlink_xlsx(content: bytes) -> tuple[dict[str, float], str]:
-    """Best-effort, conservative extraction of OECD Figure 2.1 source workbook.
+    """Extract 2026 combined statutory CIT rates from OECD Figure 2.1.
 
-    The workbook format may change. We only accept an explicit combined-rate
-    header and a country-labelled column; cannot guess from a chart data series.
+    Statlink chart workbooks do not necessarily have conventional headers:
+    jurisdictions may be in rows or columns, and rates can be a nearby
+    unlabeled series. Evaluate both orientations and validate candidates
+    against explicit 2026 rates in the OECD publication before accepting.
+    Never substitute a rate from an unrelated sheet or historical series.
     """
     sheets = pd.read_excel(BytesIO(content), sheet_name=None, header=None, engine="openpyxl")
     names = {normalized(name): name for name in COUNTRIES}
-    names.update({"korea": "South Korea", "republicofkorea": "South Korea",
-                  "turkiye": "Turkey", "czechia": "Czech Republic", "unitedstatesofamerica": "United States"})
+    names.update({
+        "korea": "South Korea", "republicofkorea": "South Korea",
+        "korearepublicof": "South Korea", "turkiye": "Turkey",
+        "czechia": "Czech Republic", "unitedstatesofamerica": "United States",
+        "uk": "United Kingdom", "usa": "United States", "us": "United States",
+    })
+    # These reference points are stated in OECD Corporate Tax Statistics 2026:
+    # France 36.1%, Colombia 35%, Hungary 9%. They help reject unrelated data.
+    anchors = {"France": 36.1, "Colombia": 35.0, "Hungary": 9.0}
+    country_keys = set(COUNTRIES)
+    candidates = []
+    notes = []
+
+    def to_country(x):
+        name = names.get(normalized(x))
+        return name if name in country_keys else None
+
+    def rate(x):
+        val = parse_number(x)
+        if val is None or not 0 <= val <= 60:
+            return None
+        return float(val)
+
+    def evaluate(pairs, sheet, orientation, label, year_label=""):
+        """A candidate is accepted only if independently published anchors match."""
+        mapping = {}
+        for name, value in pairs:
+            if name is not None and value is not None:
+                if name in mapping and abs(mapping[name] - value) > 0.05:
+                    return
+                mapping[name] = value
+        if len(mapping) < 8:
+            return
+        verified = sum(abs(mapping[key] - expected) <= 0.20
+                       for key, expected in anchors.items() if key in mapping)
+        conflicts = sum(abs(mapping[key] - expected) > 0.20
+                        for key, expected in anchors.items() if key in mapping)
+        if verified < 2 or conflicts:
+            return
+        # In the publication, the data refer to 2026; prefer this year in labels.
+        # Prefer the 2026 observation if the workbook includes several years.
+        if re.fullmatch(r"20\d{2}", year_label) and year_label != "2026":
+            return
+        score = (verified * 100 + len(mapping) + (10 if "2026" in label else 0)
+                 + (35 if year_label == "2026" else 0)
+                 + (6 if "combined" in normalized(label) else 0))
+        candidates.append((score, mapping, sheet, orientation))
+
     for sheet_name, frame in sheets.items():
-        preface = " ".join(normalized(v) for v in frame.iloc[:8].values.flatten() if pd.notna(v))
-        # Statlink from the combined-rate figure may abbreviate its chart data
-        # column to "2026" or "STR" rather than repeating the measure name.
-        official_figure = ("2026" in preface and ("statutory" in preface or "combined" in preface or "figure21" in preface))
-        for h in range(min(35, len(frame))):
-            headers = [normalized(v) for v in frame.iloc[h]]
-            country_cols = [i for i, col in enumerate(headers) if col in ("country", "jurisdiction", "economy", "location", "jurisdictions")]
-            if not country_cols and official_figure and h < 18:
-                # Some chart exports have unlabeled first-column country names.
-                country_cols = [i for i in range(min(3, frame.shape[1]))
-                                if sum(normalized(v) in names for v in frame.iloc[h + 1:h + 12, i]) >= 3]
-            rate_cols = [i for i, col in enumerate(headers) if ("combined" in col and ("rate" in col or "str" in col))]
-            if official_figure and not rate_cols:
-                rate_cols = [i for i, col in enumerate(headers) if col in ("2026", "str", "statutoryrate", "statutorycorporateincometaxrate", "corporatetaxrate")]
-            if not country_cols or not rate_cols:
+        frame = frame.dropna(axis=0, how="all").dropna(axis=1, how="all").reset_index(drop=True)
+        if frame.empty:
+            continue
+        label_text = " ".join(str(x) for x in frame.iloc[:min(12,len(frame))].values.flatten() if pd.notna(x))
+        notes.append(f"{sheet_name}: {frame.shape[0]}x{frame.shape[1]}")
+        # Find country positions in every column, without assuming a header row.
+        for country_col in range(frame.shape[1]):
+            found = [(i, to_country(frame.iat[i, country_col])) for i in range(len(frame))]
+            found = [(i, name) for i, name in found if name]
+            if len({name for _, name in found}) < 8:
                 continue
-            ci, vi = country_cols[0], next((i for i in rate_cols if i != country_cols[0]), rate_cols[0])
-            rates = {}
-            for _, row in frame.iloc[h + 1:].iterrows():
-                country = names.get(normalized(row.iloc[ci]))
-                value = parse_number(row.iloc[vi])
-                if country and value is not None and 0 <= value <= 60:
-                    rates[country] = value
-            if len(rates) >= 5 and "United States" in rates:
-                return rates, f"OECD 2026 Figure 2.1 data, worksheet '{sheet_name}' (combined statutory rate)"
-    raise ValueError("Official OECD workbook downloaded but the combined statutory 2026 country/rate columns could not be identified safely")
+            for value_col in range(frame.shape[1]):
+                if value_col == country_col:
+                    continue
+                pairs = [(name, rate(frame.iat[i, value_col])) for i, name in found]
+                header = " ".join(str(frame.iat[i, value_col]) for i in range(min(15, len(frame)))
+                                  if pd.notna(frame.iat[i, value_col]))
+                years = re.findall(r"(?<!\d)20\d{2}(?!\d)", header)
+                year_label = years[-1] if years else ""
+                evaluate(pairs, sheet_name, "countries in rows", label_text, year_label)
+
+        # Some chart source sheets put countries across a single row.
+        for country_row in range(len(frame)):
+            found = [(j, to_country(frame.iat[country_row, j])) for j in range(frame.shape[1])]
+            found = [(j, name) for j, name in found if name]
+            if len({name for _, name in found}) < 8:
+                continue
+            for value_row in range(len(frame)):
+                if value_row == country_row:
+                    continue
+                pairs = [(name, rate(frame.iat[value_row, j])) for j, name in found]
+                header = " ".join(str(frame.iat[value_row, j]) for j in range(min(8, frame.shape[1]))
+                                  if pd.notna(frame.iat[value_row, j]))
+                years = re.findall(r"(?<!\d)20\d{2}(?!\d)", header)
+                year_label = years[-1] if years else ""
+                evaluate(pairs, sheet_name, "countries in columns", label_text, year_label)
+
+    if not candidates:
+        raise ValueError(
+            "OECD workbook received, but no 2026 country/rate table passed "
+            "independent country-rate validation. Sheet shapes: " + "; ".join(notes[:8])
+        )
+    candidates.sort(key=lambda x: x[0], reverse=True)
+    _, rates, sheet_name, orientation = candidates[0]
+    # Reject conflicting equally plausible datasets instead of quietly choosing.
+    for score, other, other_sheet, _ in candidates[1:]:
+        if score < candidates[0][0] - 15:
+            break
+        common = set(rates) & set(other)
+        if len(common) >= 8 and any(abs(rates[k] - other[k]) > 0.20 for k in common):
+            raise ValueError(f"Conflicting OECD 2026 candidates: {sheet_name} vs {other_sheet}")
+    return rates, (f"OECD Corporate Tax Statistics 2026, Figure 2.1; "
+                   f"{len(rates)} countries; '{sheet_name}' ({orientation}); "
+                   "checked against published France/Colombia/Hungary rates")
 
 
 def load_oecd_tax() -> tuple[dict[str, float], str]:
